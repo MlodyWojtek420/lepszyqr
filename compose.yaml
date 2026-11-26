@@ -1,0 +1,75 @@
+# Stack dla Dockge. Obrazy backend/frontend są budowane z repozytorium Git (REPO_URL w .env).
+# Wymaga Docker Compose v2.22+ (pull_policy: build).
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ${REPO_URL}#${REPO_REF:-main}:backend
+    pull_policy: build
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      SECRET_KEY: ${SECRET_KEY}
+      ADMIN_USER: ${ADMIN_USER}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      EXPORT_API_KEY: ${EXPORT_API_KEY:-}
+      DATA_DIR: /data
+    volumes:
+      - ./data/files:/data
+    shm_size: 1gb
+
+  frontend:
+    build:
+      context: ${REPO_URL}#${REPO_REF:-main}:frontend
+    pull_policy: build
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "${HTTP_PORT:-8080}:80"
+
+  # Codzienna kopia zapasowa: baza (pg_dump) + zdjęcia/QR/szablon -> ./backups
+  backup:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGHOST: db
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB}
+      KEEP_DAYS: ${BACKUP_KEEP_DAYS:-30}
+    volumes:
+      - ./data/files:/data
+      - ./backups:/backups
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        while true; do
+          STAMP=$$(date +%Y%m%d-%H%M%S)
+          pg_dump --clean --if-exists | gzip > /backups/db-$$STAMP.sql.gz \
+            && tar -czf /backups/files-$$STAMP.tar.gz --exclude=./tmp -C /data . \
+            && echo "Kopia $$STAMP gotowa" || echo "BLAD kopii $$STAMP"
+          find /backups -type f \( -name 'db-*.sql.gz' -o -name 'files-*.tar.gz' \) -mtime +$$KEEP_DAYS -delete
+          sleep 86400
+        done
